@@ -2,7 +2,8 @@ import argparse
 import json
 import os
 import shutil
-from pathlib import Path
+import tempfile
+from pathlib import Path, PurePosixPath
 
 from huggingface_hub import hf_hub_download
 
@@ -22,14 +23,21 @@ def dataset_dir_for_variant(name: str) -> str:
 
 
 def local_path_for_remote(relative_path: str) -> Path:
+    remote_name = PurePosixPath(relative_path)
+    if remote_name.is_absolute() or not remote_name.parts or ".." in remote_name.parts or "\\" in relative_path:
+        raise ValueError(f"invalid remote artifact path: {relative_path!r}")
     remote_path = Path(relative_path)
     if REMOTE_ROOT_PREFIX and remote_path.parts[:1] == (REMOTE_ROOT_PREFIX,):
         remote_path = remote_path.relative_to(REMOTE_ROOT_PREFIX)
     if remote_path.parts[:1] == ("datasets",):
-        return DATASETS_DIR.joinpath(*remote_path.parts[1:])
-    if remote_path.parts[:1] == ("tokenizers",):
-        return TOKENIZERS_DIR.joinpath(*remote_path.parts[1:])
-    return ROOT / remote_path
+        destination = DATASETS_DIR.joinpath(*remote_path.parts[1:])
+    elif remote_path.parts[:1] == ("tokenizers",):
+        destination = TOKENIZERS_DIR.joinpath(*remote_path.parts[1:])
+    else:
+        destination = ROOT / remote_path
+    if not destination.resolve().is_relative_to(ROOT.resolve()):
+        raise ValueError(f"artifact path escapes the data directory: {relative_path!r}")
+    return destination
 
 
 def get(relative_path: str) -> None:
@@ -52,10 +60,15 @@ def get(relative_path: str) -> None:
     # always materialize a real file in data/, not a broken relative symlink.
     cached_source = cached_path.resolve(strict=True)
     destination.parent.mkdir(parents=True, exist_ok=True)
+    # Publish only complete copies. Interrupted copies must not be treated as a
+    # completed shard on the next run, and local edits must not alter HF's cache.
+    with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as tmp:
+        temporary = Path(tmp.name)
     try:
-        os.link(cached_source, destination)
-    except OSError:
-        shutil.copy2(cached_source, destination)
+        shutil.copyfile(cached_source, temporary)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def manifest_path() -> Path:
